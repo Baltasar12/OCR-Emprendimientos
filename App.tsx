@@ -21,6 +21,7 @@ const App: React.FC = () => {
   const [failedFiles, setFailedFiles] = useState<{ name: string; reason: string }[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [processingFileCount, setProcessingFileCount] = useState(0);
+  const [processingStatus, setProcessingStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isAppReady, setIsAppReady] = useState(false);
   const dataFormRef = useRef<DataFormHandle>(null);
@@ -65,49 +66,43 @@ const App: React.FC = () => {
     setProcessingFileCount(files.length);
     setAppState(AppState.PROCESSING);
     setError(null);
-
-    const results = await Promise.allSettled(
-      files.map(async (file) => {
-        if (file.type === 'application/pdf') {
-            const isText = await isPdfTextBased(file);
-            if (isText) {
-                // Route 2: Native PDF -> Extract text first
-                console.log(`[Router] File ${file.name} is a text-based PDF. Extracting text.`);
-                const text = await extractTextFromPdf(file);
-                return await extractInvoiceData(text);
-            } else {
-                // Route 1: Image PDF -> Send file directly
-                console.log(`[Router] File ${file.name} is an image-based PDF. Sending for OCR.`);
-                return await extractInvoiceData(file);
-            }
-        } else {
-            // Route 1: Image (JPG, PNG) -> Send file directly
-            console.log(`[Router] File ${file.name} is an image. Sending for OCR.`);
-            return await extractInvoiceData(file);
-        }
-      })
-    );
+    setProcessingStatus(null);
 
     const successfulInvoices: InvoiceData[] = [];
     const successfulFiles: File[] = [];
     const failed: { name: string; reason: string }[] = [];
 
-    results.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
-        const ocrData = result.value;
-        
+    for (const [index, file] of files.entries()) {
+      setProcessingStatus(`Procesando factura ${index + 1} de ${files.length}...`);
+      try {
+        let ocrData;
+        if (file.type === 'application/pdf') {
+          const isText = await isPdfTextBased(file);
+          if (isText) {
+            console.log(`[Router] File ${file.name} is a text-based PDF. Extracting text.`);
+            const text = await extractTextFromPdf(file);
+            ocrData = await extractInvoiceData(text);
+          } else {
+            console.log(`[Router] File ${file.name} is an image-based PDF. Sending for OCR.`);
+            ocrData = await extractInvoiceData(file);
+          }
+        } else {
+          console.log(`[Router] File ${file.name} is an image. Sending for OCR.`);
+          ocrData = await extractInvoiceData(file);
+        }
+
         const normalizedCuit = ocrData.cuit.replace(/-/g, '');
         let identifiedSupplierCuit: string | undefined = undefined;
-        
+
         for (const [keyCuit] of masterData.entries()) {
-            if (keyCuit.replace(/-/g, '') === normalizedCuit) {
-                identifiedSupplierCuit = keyCuit;
-                break;
-            }
+          if (keyCuit.replace(/-/g, '') === normalizedCuit) {
+            identifiedSupplierCuit = keyCuit;
+            break;
+          }
         }
-        
+
         const supplierInfo = identifiedSupplierCuit ? masterData.get(identifiedSupplierCuit) : undefined;
-        
+
         const matchedItems: LineItem[] = ocrData.items.map((ocrItem, itemIndex) => {
           const defaultItem = {
             id: `item-${Date.now()}-${itemIndex}`,
@@ -136,15 +131,17 @@ const App: React.FC = () => {
         });
 
         successfulInvoices.push({ ...ocrData, items: matchedItems, identifiedSupplierCuit, usePreloadedCatalog: false });
-        successfulFiles.push(files[index]);
-      } else {
+        successfulFiles.push(file);
+
+      } catch (error) {
         failed.push({
-          name: files[index].name,
-          reason: result.reason instanceof Error ? result.reason.message : 'Unknown error',
+          name: file.name,
+          reason: error instanceof Error ? error.message : 'Unknown error',
         });
       }
-    });
-
+    }
+    
+    setProcessingStatus(null);
     setBatchData(successfulInvoices);
     setProcessedFiles(successfulFiles);
     setFailedFiles(failed);
@@ -164,6 +161,7 @@ const App: React.FC = () => {
     setFailedFiles([]);
     setCurrentIndex(0);
     setProcessingFileCount(0);
+    setProcessingStatus(null);
     setError(null);
     setMasterData(null);
     localStorage.removeItem('masterDatabase');
@@ -176,6 +174,7 @@ const App: React.FC = () => {
     setFailedFiles([]);
     setCurrentIndex(0);
     setProcessingFileCount(0);
+    setProcessingStatus(null);
     setError(null);
     setAppState(AppState.IDLE);
   }, []);
@@ -274,7 +273,9 @@ const App: React.FC = () => {
         return (
           <div className="flex flex-col items-center justify-center h-full text-center">
             <Spinner />
-            <p className="text-slate-600 mt-4 text-lg">Analizando {processingFileCount} documentos...</p>
+            <p className="text-slate-600 mt-4 text-lg">
+              {processingStatus || `Analizando ${processingFileCount} documentos...`}
+            </p>
             <p className="text-slate-500 mt-1">Esto puede tomar unos momentos. ¡La IA está haciendo su magia!</p>
           </div>
         );
