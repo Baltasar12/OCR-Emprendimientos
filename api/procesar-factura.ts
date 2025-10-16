@@ -28,6 +28,16 @@ export async function POST(request: Request) {
     };
 
     const result = await model.generateContent([prompt, imagePart]);
+    
+       // --- INICIO DE LA CORRECCIÓN ---
+    let jsonResponse = result.response.text();
+
+    // Limpiamos el posible formato Markdown que a veces añade la IA
+    if (jsonResponse.startsWith("```json")) {
+      jsonResponse = jsonResponse.replace("```json", "").replace("```", "").trim();
+    }
+    // --- FIN DE LA CORRECCIÓN ---
+    
     return new Response(result.response.text(), { 
       status: 200, 
       headers: { 'Content-Type': 'application/json' }
