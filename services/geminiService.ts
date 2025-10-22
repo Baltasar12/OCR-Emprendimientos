@@ -1,24 +1,64 @@
 // @ts-nocheck
 declare var pdfjsLib: any;
 
-import type { InvoiceData } from '../types';
-
-interface OcrLineItem {
-  quantity: number;
-  description: string;
-  unitPrice: number;
-  total: number;
-}
-
-// Type for raw data returned by Gemini
-type GeminiInvoiceData = Omit<InvoiceData, 'items' | 'usePreloadedCatalog' | 'identifiedSupplierCuit'> & { items: OcrLineItem[] };
+// Fix: Imported GeminiInvoiceData from types.ts where it has been centralized.
+import type { InvoiceData, GeminiInvoiceData } from '../types';
 
 /**
- * "Sanitizes" a PDF by rendering its first page to a JPEG image.
- * This helps bypass potential upload issues with malformed PDFs.
- * @param file The original PDF file.
- * @returns A new File object representing the JPEG image.
+ * Initiates the asynchronous processing of an invoice file.
+ * @param file The invoice file (image or PDF) to process.
+ * @returns A promise that resolves to an object containing the job ID.
  */
+export const startInvoiceProcessing = async (file: File): Promise<{ jobId: string }> => {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+        const response = await fetch('/api/procesar-factura', {
+            method: 'POST',
+            body: formData,
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({ error: 'Failed to parse error response.' }));
+            throw new Error(errorData.error || 'Server responded with an error.');
+        }
+
+        return await response.json();
+    } catch (error) {
+        console.error("Error starting invoice processing:", error);
+        const message = error instanceof Error ? error.message : "An unknown error occurred.";
+        throw new Error(`Could not start processing for ${file.name}. Reason: ${message}`);
+    }
+};
+
+/**
+ * Checks the status of a processing job.
+ * @param jobId The ID of the job to check.
+ * @returns A promise that resolves to the current status object of the job.
+ */
+export const checkJobStatus = async (jobId: string): Promise<any> => {
+    try {
+        const response = await fetch(`/api/verificar-estado?jobId=${jobId}`);
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({ error: 'Failed to parse error response.' }));
+            throw new Error(errorData.error || 'Server responded with an error.');
+        }
+
+        return await response.json();
+    } catch (error) {
+        console.error(`Error checking status for job ${jobId}:`, error);
+        // Return a failed status so the polling logic can handle it
+        return { status: 'failed', error: error.message };
+    }
+};
+
+
+/*
+// The original synchronous function is no longer used by the frontend.
+// It is replaced by startInvoiceProcessing and checkJobStatus.
+
 const sanitizePdf = async (file: File): Promise<File> => {
     console.log("Sanitizing PDF:", file.name);
     try {
@@ -116,3 +156,4 @@ export const extractInvoiceData = async (source: File | string): Promise<GeminiI
         throw new Error(`No se pudo procesar el documento. Razón: ${message}`);
     }
 };
+*/

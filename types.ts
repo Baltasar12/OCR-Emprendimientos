@@ -1,4 +1,3 @@
-
 // Structure for a single row in the master product CSV
 export interface MasterProduct {
   supplierCuit: string;
@@ -50,6 +49,17 @@ export interface InvoiceData {
   items: LineItem[];
   originalItems?: LineItem[]; // To backup items when pre-loading catalog
 }
+
+// Fix: Moved OcrLineItem and GeminiInvoiceData here from geminiService.ts to centralize types.
+export interface OcrLineItem {
+  quantity: number;
+  description: string;
+  unitPrice: number;
+  total: number;
+}
+
+// Type for raw data returned by Gemini
+export type GeminiInvoiceData = Omit<InvoiceData, 'items' | 'usePreloadedCatalog' | 'identifiedSupplierCuit' | 'originalItems'> & { items: OcrLineItem[] };
 
 export enum AppState {
   AWAITING_MASTER_DATA = 'AWAITING_MASTER_DATA', // New initial state

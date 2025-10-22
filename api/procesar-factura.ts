@@ -1,34 +1,4 @@
-import { GoogleGenAI, Type } from "@google/genai";
-
-// This schema must be kept in sync with the frontend's expectations and the prompt.
-const invoiceSchema = {
-    type: Type.OBJECT,
-    properties: {
-        invoiceNumber: { type: Type.STRING, description: "Número de Factura o Comprobante, ej: 0004-00123456" },
-        invoiceDate: { type: Type.STRING, description: "Fecha de la factura en formato YYYY-MM-DD" },
-        supplierName: { type: Type.STRING, description: "Nombre o Razón Social del emisor de la factura" },
-        cuit: { type: Type.STRING, description: "C.U.I.T. del emisor, ej: 30-12345678-9" },
-        totalAmount: { type: Type.NUMBER, description: "El importe total final de la factura" },
-        ivaPerception: { type: Type.NUMBER, description: "Percepción de IVA si existe, sino null" },
-        grossIncomePerception: { type: Type.NUMBER, description: "Percepción de Ingresos Brutos si existe, sino null" },
-        otherTaxes: { type: Type.NUMBER, description: "Otros impuestos si existen, sino null" },
-        items: {
-            type: Type.ARRAY,
-            description: "Lista de items o productos en la factura",
-            items: {
-                type: Type.OBJECT,
-                properties: {
-                    quantity: { type: Type.NUMBER, description: "Cantidad del item" },
-                    description: { type: Type.STRING, description: "Descripción del producto o servicio" },
-                    unitPrice: { type: Type.NUMBER, description: "Precio por unidad del item" },
-                    total: { type: Type.NUMBER, description: "Importe total para este item (cantidad * precio unitario)" },
-                },
-                required: ["quantity", "description", "unitPrice", "total"]
-            }
-        }
-    },
-    required: ["invoiceNumber", "invoiceDate", "cuit", "supplierName", "totalAmount", "items"]
-};
+import { kv } from '@vercel/kv';
 
 // Required for Vercel Edge Functions
 export const config = {
@@ -51,64 +21,54 @@ export default async function handler(request: Request) {
     return new Response(JSON.stringify({ error: 'Method Not Allowed' }), { status: 405, headers: { 'Content-Type': 'application/json' } });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY; 
-  if (!apiKey) {
-    return new Response(JSON.stringify({ error: 'API Key no configurada en el servidor' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-  }
-
   try {
     const formData = await request.formData();
     const file = formData.get('file') as File | null;
-    const prompt = formData.get('prompt') as string;
-    const sourceIsText = formData.get('sourceIsText') === 'true';
-    const textContent = formData.get('textContent') as string | null;
 
-    if (!file && !sourceIsText) {
-      return new Response(JSON.stringify({ error: 'No se recibió ningún archivo o texto' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    if (!file) {
+      return new Response(JSON.stringify({ error: 'No se recibió ningún archivo' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
     }
-
-    const ai = new GoogleGenAI({ apiKey });
     
-    let contents: any; // Type is GenerateContentParameters['contents']
+    // 1. Generate a unique job ID
+    const jobId = crypto.randomUUID();
 
-    if (sourceIsText && textContent) {
-      contents = { parts: [{ text: textContent }, { text: prompt }] };
-    } else if (file) {
-      const imagePart = {
-        inlineData: {
-          data: arrayBufferToBase64(await file.arrayBuffer()),
-          mimeType: file.type,
-        },
-      };
-      contents = { parts: [imagePart, { text: prompt }] };
-    } else {
-      return new Response(JSON.stringify({ error: 'Entrada inválida' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-    }
+    // 2. Convert file to base64 to pass it in a JSON body to the worker
+    const fileBuffer = await file.arrayBuffer();
+    const fileData = arrayBufferToBase64(fileBuffer);
+    const mimeType = file.type;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: contents,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: invoiceSchema,
+    // 3. Save initial state in Vercel KV
+    await kv.set(jobId, { status: 'pending', filename: file.name, jobId });
+
+    // 4. Invoke the worker in the background (fire-and-forget)
+    const host = request.headers.get('host');
+    const protocol = host?.startsWith('localhost') ? 'http' : 'https';
+    const workerUrl = `${protocol}://${host}/api/realizar-ocr`;
+    
+    // We don't await this fetch call. This is the key to the async pattern.
+    fetch(workerUrl, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        // Pass auth headers if needed in a real application
       },
+      body: JSON.stringify({
+        jobId,
+        fileData,
+        mimeType
+      }),
     });
 
-    let jsonString = response.text;
-    
-    // Safeguard to remove markdown code fences if the AI adds them
-    if (jsonString.startsWith("```json")) {
-        jsonString = jsonString.replace("```json", "").replace("```", "").trim();
-    }
-
-    return new Response(jsonString, { 
-      status: 200, 
-      headers: { 'Content-Type': 'application/json' }
+    // 5. Respond immediately to the client with the job ID.
+    // The 202 Accepted status code is perfect for this "job started" scenario.
+    return new Response(JSON.stringify({ jobId }), {
+      status: 202,
+      headers: { 'Content-Type': 'application/json' },
     });
 
   } catch (error) {
-    console.error('Error in serverless function:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Error interno del servidor al procesar con la IA';
+    console.error('Error in /api/procesar-factura:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Error interno del servidor al iniciar el procesamiento';
     return new Response(JSON.stringify({ error: errorMessage }), { status: 500, headers: { 'Content-Type': 'application/json' } });
   }
 }

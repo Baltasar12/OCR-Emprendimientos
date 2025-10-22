@@ -1,7 +1,7 @@
 
 import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
-import { extractInvoiceData } from './services/geminiService';
-import type { InvoiceData, LineItem, MasterDatabase } from './types';
+import { startInvoiceProcessing, checkJobStatus } from './services/geminiService';
+import type { GeminiInvoiceData, InvoiceData, LineItem, MasterDatabase } from './types';
 import { AppState } from './types';
 import MasterUploader from './components/MasterUploader';
 import ImageUploader from './components/ImageUploader';
@@ -10,8 +10,16 @@ import DataForm, { DataFormHandle } from './components/DataForm';
 import Spinner from './components/Spinner';
 import { findBestMatch } from './utils/stringMatcher';
 import { LogoIcon, ChevronLeftIcon, ChevronRightIcon, DownloadIcon, CheckCircleIcon } from './components/icons';
-import { isPdfTextBased, extractTextFromPdf } from './services/pdfUtils';
 import ResizablePanels from './components/ResizablePanels';
+
+// Define the structure for tracking asynchronous jobs
+interface ProcessingJob {
+  jobId: string;
+  file: File;
+  status: 'pending' | 'complete' | 'failed';
+  data?: GeminiInvoiceData;
+  error?: string;
+}
 
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.AWAITING_MASTER_DATA);
@@ -20,11 +28,11 @@ const App: React.FC = () => {
   const [processedFiles, setProcessedFiles] = useState<File[]>([]);
   const [failedFiles, setFailedFiles] = useState<{ name: string; reason: string }[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
-  const [processingFileCount, setProcessingFileCount] = useState(0);
   const [processingStatus, setProcessingStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isAppReady, setIsAppReady] = useState(false);
   const dataFormRef = useRef<DataFormHandle>(null);
+  const pollingIntervalRef = useRef<number | null>(null);
 
   useEffect(() => {
     try {
@@ -43,6 +51,12 @@ const App: React.FC = () => {
     } finally {
       setIsAppReady(true);
     }
+    // Cleanup interval on unmount
+    return () => {
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+      }
+    };
   }, []);
 
   const handleMasterDataLoad = useCallback((data: MasterDatabase) => {
@@ -63,104 +77,130 @@ const App: React.FC = () => {
       return;
     }
 
-    setProcessingFileCount(files.length);
     setAppState(AppState.PROCESSING);
     setError(null);
-    setProcessingStatus(null);
-
-    const successfulInvoices: InvoiceData[] = [];
-    const successfulFiles: File[] = [];
-    const failed: { name: string; reason: string }[] = [];
-
-    for (const [index, file] of files.entries()) {
-      setProcessingStatus(`Procesando factura ${index + 1} de ${files.length}...`);
-      try {
-        let ocrData;
-        if (file.type === 'application/pdf') {
-          const isText = await isPdfTextBased(file);
-          if (isText) {
-            console.log(`[Router] File ${file.name} is a text-based PDF. Extracting text.`);
-            const text = await extractTextFromPdf(file);
-            ocrData = await extractInvoiceData(text);
-          } else {
-            console.log(`[Router] File ${file.name} is an image-based PDF. Sending for OCR.`);
-            ocrData = await extractInvoiceData(file);
-          }
-        } else {
-          console.log(`[Router] File ${file.name} is an image. Sending for OCR.`);
-          ocrData = await extractInvoiceData(file);
-        }
-
-        const normalizedCuit = ocrData.cuit.replace(/-/g, '');
-        let identifiedSupplierCuit: string | undefined = undefined;
-
-        for (const [keyCuit] of masterData.entries()) {
-          if (keyCuit.replace(/-/g, '') === normalizedCuit) {
-            identifiedSupplierCuit = keyCuit;
-            break;
-          }
-        }
-
-        const supplierInfo = identifiedSupplierCuit ? masterData.get(identifiedSupplierCuit) : undefined;
-
-        const matchedItems: LineItem[] = ocrData.items.map((ocrItem, itemIndex) => {
-          const defaultItem = {
-            id: `item-${Date.now()}-${itemIndex}`,
-            ocrDescription: ocrItem.description,
-            ocrQuantity: ocrItem.quantity,
-            ocrUnitPrice: ocrItem.unitPrice,
-            productCode: '',
-            productName: 'N/A',
-            quantity: ocrItem.quantity,
-            unitPrice: ocrItem.unitPrice,
-            total: ocrItem.total,
-          };
-
-          if (supplierInfo) {
-            const productCandidates: { productCode: string; productName: string }[] = supplierInfo.products;
-            const bestMatch = findBestMatch(ocrItem.description, productCandidates, p => p.productName);
-            if (bestMatch) {
-              return {
-                ...defaultItem,
-                productCode: bestMatch.bestMatch.productCode,
-                productName: bestMatch.bestMatch.productName,
-              };
-            }
-          }
-          return defaultItem;
-        });
-
-        successfulInvoices.push({ ...ocrData, items: matchedItems, identifiedSupplierCuit, usePreloadedCatalog: false });
-        successfulFiles.push(file);
-
-      } catch (error) {
-        failed.push({
-          name: file.name,
-          reason: error instanceof Error ? error.message : 'Unknown error',
-        });
-      }
-    }
+    setProcessingStatus(`Iniciando procesamiento para ${files.length} documentos...`);
     
-    setProcessingStatus(null);
-    setBatchData(successfulInvoices);
-    setProcessedFiles(successfulFiles);
-    setFailedFiles(failed);
+    let jobs: ProcessingJob[] = [];
 
-    if (successfulInvoices.length > 0) {
-      setCurrentIndex(0);
-      setAppState(AppState.REVIEWING);
-    } else {
-      setError(`Failed to process all ${files.length} documents.`);
+    // Phase 1: Start all processing jobs
+    try {
+      const jobStartPromises = files.map(file => 
+        startInvoiceProcessing(file).then(result => ({ ...result, file }))
+      );
+      const startedJobs = await Promise.all(jobStartPromises);
+      jobs = startedJobs.map(job => ({ ...job, status: 'pending' }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to start processing jobs.');
       setAppState(AppState.ERROR);
+      return;
     }
+
+    // Phase 2: Polling
+    pollingIntervalRef.current = window.setInterval(async () => {
+      const pendingJobs = jobs.filter(job => job.status === 'pending');
+      
+      if (pendingJobs.length === 0) {
+        if (pollingIntervalRef.current) clearInterval(pollingIntervalRef.current);
+
+        // Phase 3: Finalization
+        setProcessingStatus("Mapeando productos y finalizando...");
+
+        const successfulInvoices: InvoiceData[] = [];
+        const successfulFiles: File[] = [];
+        const failed: { name: string; reason: string }[] = [];
+
+        for (const job of jobs) {
+          if (job.status === 'complete' && job.data) {
+            const ocrData = job.data;
+            const normalizedCuit = ocrData.cuit.replace(/-/g, '');
+            let identifiedSupplierCuit: string | undefined = undefined;
+
+            for (const [keyCuit] of masterData.entries()) {
+              if (keyCuit.replace(/-/g, '') === normalizedCuit) {
+                identifiedSupplierCuit = keyCuit;
+                break;
+              }
+            }
+            const supplierInfo = identifiedSupplierCuit ? masterData.get(identifiedSupplierCuit) : undefined;
+
+            const matchedItems: LineItem[] = ocrData.items.map((ocrItem, itemIndex) => {
+              const defaultItem = {
+                id: `item-${Date.now()}-${itemIndex}`,
+                ocrDescription: ocrItem.description,
+                ocrQuantity: ocrItem.quantity,
+                ocrUnitPrice: ocrItem.unitPrice,
+                productCode: '',
+                productName: 'N/A',
+                quantity: ocrItem.quantity,
+                unitPrice: ocrItem.unitPrice,
+                total: ocrItem.total,
+              };
+              if (supplierInfo) {
+                const productCandidates = supplierInfo.products;
+                const bestMatch = findBestMatch(ocrItem.description, productCandidates, p => p.productName);
+                if (bestMatch) {
+                  return {
+                    ...defaultItem,
+                    productCode: bestMatch.bestMatch.productCode,
+                    productName: bestMatch.bestMatch.productName,
+                  };
+                }
+              }
+              return defaultItem;
+            });
+            successfulInvoices.push({ ...ocrData, items: matchedItems, identifiedSupplierCuit, usePreloadedCatalog: false });
+            successfulFiles.push(job.file);
+          } else {
+            failed.push({
+              name: job.file.name,
+              reason: job.error || 'Unknown processing error.',
+            });
+          }
+        }
+        
+        setProcessingStatus(null);
+        setBatchData(successfulInvoices);
+        setProcessedFiles(successfulFiles);
+        setFailedFiles(failed);
+
+        if (successfulInvoices.length > 0) {
+          setCurrentIndex(0);
+          setAppState(AppState.REVIEWING);
+        } else {
+          setError(`Failed to process all ${files.length} documents.`);
+          setAppState(AppState.ERROR);
+        }
+        return;
+      }
+
+      // Check status for all pending jobs
+      const statusCheckPromises = pendingJobs.map(job => checkJobStatus(job.jobId));
+      const statuses = await Promise.all(statusCheckPromises);
+
+      // Update local job statuses
+      jobs = jobs.map(job => {
+        if (job.status === 'pending') {
+          const update = statuses.find(s => s.jobId === job.jobId);
+          if (update && update.status !== 'pending') {
+            return { ...job, status: update.status, data: update.data, error: update.error };
+          }
+        }
+        return job;
+      });
+
+      const completedCount = jobs.filter(j => j.status !== 'pending').length;
+      setProcessingStatus(`Procesando... (${completedCount} de ${jobs.length} completados)`);
+    }, 4000); // Poll every 4 seconds
+
   }, [masterData]);
+
 
   const handleFullReset = useCallback(() => {
     setBatchData([]);
     setProcessedFiles([]);
     setFailedFiles([]);
     setCurrentIndex(0);
-    setProcessingFileCount(0);
     setProcessingStatus(null);
     setError(null);
     setMasterData(null);
@@ -173,7 +213,6 @@ const App: React.FC = () => {
     setProcessedFiles([]);
     setFailedFiles([]);
     setCurrentIndex(0);
-    setProcessingFileCount(0);
     setProcessingStatus(null);
     setError(null);
     setAppState(AppState.IDLE);
@@ -200,21 +239,13 @@ const App: React.FC = () => {
   };
 
   const exportAllToCsv = () => {
-    // 1. Guardar explícitamente el estado actual del formulario
-    // Esto llama a onDataChange y actualiza el estado 'batchData' de React.
     if (dataFormRef.current) {
         dataFormRef.current.save();
     }
-
-    // 2. Usar una función de callback con setBatchData para garantizar que usamos el estado más reciente
     setBatchData(currentBatchData => {
-        
-        // 3. Ahora 'currentBatchData' es la versión más fresca y segura del estado
         if (currentBatchData.length === 0) return currentBatchData;
-
         const headers = ['Numero_Factura', 'Fecha_Factura', 'Fecha_Registro', 'Cod_Producto', 'Cantidad_Final', 'Precio_Final', 'Importe_Final'];
         const today = new Date().toISOString().split('T')[0];
-
         const allRows = currentBatchData.flatMap(invoice =>
             invoice.items
                 .filter(item => item.productCode && item.quantity > 0)
@@ -228,12 +259,10 @@ const App: React.FC = () => {
                     item.total,
                 ].join(','))
         );
-
         if (allRows.length === 0) {
-            alert("No valid items to export. Please ensure products are mapped and quantities are greater than zero.");
-            return currentBatchData; // Devuelve el estado sin cambios
+            alert("No valid items to export.");
+            return currentBatchData;
         }
-
         const csvContent = [headers.join(','), ...allRows].join('\n');
         const blob = new Blob([`\uFEFF${csvContent}`], { type: 'text/csv;charset=utf-8;' });
         const link = document.createElement('a');
@@ -245,11 +274,8 @@ const App: React.FC = () => {
         link.click();
         document.body.removeChild(link);
         URL.revokeObjectURL(url);
-        
-        // Actualizar el estado de la aplicación para mostrar el mensaje de éxito
         setAppState(AppState.EXPORTED);
-        
-        return currentBatchData; // Devuelve el estado sin cambios
+        return currentBatchData;
     });
   };
 
@@ -274,7 +300,7 @@ const App: React.FC = () => {
           <div className="flex flex-col items-center justify-center h-full text-center">
             <Spinner />
             <p className="text-slate-600 mt-4 text-lg">
-              {processingStatus || `Analizando ${processingFileCount} documentos...`}
+              {processingStatus || `Analizando documentos...`}
             </p>
             <p className="text-slate-500 mt-1">Esto puede tomar unos momentos. ¡La IA está haciendo su magia!</p>
           </div>
