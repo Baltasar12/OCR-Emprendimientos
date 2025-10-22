@@ -31,9 +31,9 @@ const invoiceSchema = {
 };
 
 // Required for Vercel Edge Functions
-export const config = {
-  runtime: 'edge',
-};
+// export const config = {
+//   runtime: 'edge',
+// };
 
 // Helper to encode ArrayBuffer to Base64 in an edge environment
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
